@@ -1,0 +1,6 @@
+{
+  "name": "Personal Gemini Journal",
+  "description": "A secure, multi-turn AI journal with Firebase Authentication, per-user Cloud Firestore isolation, automated conversation summaries, and server-side Gemini API integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
