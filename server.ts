@@ -14,10 +14,47 @@ const adminApp = !getApps().length
 // Resilient Gemini Initialization with fallback ladder
 const FALLBACK_MODELS = [
   'gemini-3.6-flash',
-  'gemini-2.5-flash',
   'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-flash-latest',
+  'gemini-3.7-flash',
   'gemini-3.5-flash-lite',
 ];
+
+const MAX_RETRIES_PER_MODEL = 2; // Initial attempt + 1 retry with exponential backoff
+const INITIAL_BACKOFF_MS = 400;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientError(err: unknown): boolean {
+  if (!err) return false;
+  const errorObj = err as { status?: number; statusCode?: number; code?: number | string; message?: string };
+  const status = errorObj.status || errorObj.statusCode;
+  const message = (errorObj.message || '').toLowerCase();
+
+  if (status === 503 || status === 429 || status === 500 || status === 504) return true;
+  if (typeof errorObj.code === 'number' && [503, 429, 500, 504].includes(errorObj.code)) return true;
+  if (typeof errorObj.code === 'string' && (errorObj.code.includes('UNAVAILABLE') || errorObj.code.includes('RESOURCE_EXHAUSTED') || errorObj.code.includes('DEADLINE_EXCEEDED'))) return true;
+
+  if (
+    message.includes('503') ||
+    message.includes('unavailable') ||
+    message.includes('high demand') ||
+    message.includes('overloaded') ||
+    message.includes('resource exhausted') ||
+    message.includes('rate limit') ||
+    message.includes('too many requests') ||
+    message.includes('try again later') ||
+    message.includes('quota') ||
+    message.includes('internal error')
+  ) {
+    return true;
+  }
+
+  return false;
+}
 
 function getGenAI(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -41,34 +78,60 @@ async function generateContentWithFallback(
   const ai = getGenAI();
   let lastError: unknown = null;
 
-  for (const model of FALLBACK_MODELS) {
-    try {
-      const config: Record<string, unknown> = {};
-      if (options.systemInstruction) {
-        config.systemInstruction = options.systemInstruction;
-      }
-      if (options.responseSchema) {
-        config.responseSchema = options.responseSchema;
-      }
-      if (options.responseMimeType) {
-        config.responseMimeType = options.responseMimeType;
-      }
-      if (options.temperature !== undefined) {
-        config.temperature = options.temperature;
-      }
+  for (let modelIdx = 0; modelIdx < FALLBACK_MODELS.length; modelIdx++) {
+    const model = FALLBACK_MODELS[modelIdx];
 
-      const response = await ai.models.generateContent({
-        model,
-        contents,
-        config: Object.keys(config).length > 0 ? config : undefined,
-      });
+    for (let attempt = 1; attempt <= MAX_RETRIES_PER_MODEL; attempt++) {
+      try {
+        const config: Record<string, unknown> = {};
+        if (options.systemInstruction) {
+          config.systemInstruction = options.systemInstruction;
+        }
+        if (options.responseSchema) {
+          config.responseSchema = options.responseSchema;
+        }
+        if (options.responseMimeType) {
+          config.responseMimeType = options.responseMimeType;
+        }
+        if (options.temperature !== undefined) {
+          config.temperature = options.temperature;
+        }
 
-      if (response && response.text) {
-        return { text: response.text, modelUsed: model };
+        const response = await ai.models.generateContent({
+          model,
+          contents,
+          config: Object.keys(config).length > 0 ? config : undefined,
+        });
+
+        if (response && response.text) {
+          if (modelIdx > 0) {
+            console.log(`[Gemini Fallback] Successfully served request using fallback model: ${model} (escalated from ${FALLBACK_MODELS[0]})`);
+          } else {
+            console.log(`[Gemini Gateway] Successfully served request with primary model: ${model}`);
+          }
+          return { text: response.text, modelUsed: model };
+        }
+      } catch (err: unknown) {
+        lastError = err;
+        const errMsg = (err as Error)?.message || String(err);
+        const isTransient = isTransientError(err);
+
+        console.warn(`[Gemini Fallback] Model ${model} (attempt ${attempt}/${MAX_RETRIES_PER_MODEL}) encountered error: ${errMsg}`);
+
+        if (isTransient && attempt < MAX_RETRIES_PER_MODEL) {
+          const jitter = Math.floor(Math.random() * 200);
+          const backoffDelay = INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1) + jitter;
+          console.warn(`[Gemini Fallback] Transient/503 error detected on ${model}. Retrying with exponential backoff in ${backoffDelay}ms...`);
+          await sleep(backoffDelay);
+        } else {
+          // If not transient or retries exhausted for this model, break to try next fallback model
+          break;
+        }
       }
-    } catch (err: unknown) {
-      console.warn(`[Gemini Fallback] Model ${model} failed:`, (err as Error)?.message || err);
-      lastError = err;
+    }
+
+    if (modelIdx < FALLBACK_MODELS.length - 1) {
+      console.warn(`[Gemini Fallback] Escalating from ${model} to next Flash fallback model: ${FALLBACK_MODELS[modelIdx + 1]}`);
     }
   }
 
@@ -146,10 +209,19 @@ async function startServer() {
 Help the user reflect deeper, unpack emotional layers, understand patterns, and find clarity.
 Keep your conversational response engaging, warm, grounded, and concise (2-4 paragraphs max). Avoid clinical jargon.`;
 
-      const aiResponse = await generateContentWithFallback(cleanPrompt, {
-        systemInstruction,
-        temperature: 0.7,
-      });
+      let aiResponse: { text: string; modelUsed: string };
+      try {
+        aiResponse = await generateContentWithFallback(cleanPrompt, {
+          systemInstruction,
+          temperature: 0.7,
+        });
+      } catch (genErr) {
+        console.error('[Gemini Gateway] All fallback models exhausted for initial reflection:', (genErr as Error)?.message);
+        aiResponse = {
+          text: `Thank you for taking the time to write this reflection. Your entry has been safely captured.\n\nWhile the AI assistant is temporarily experiencing high global demand, your thoughts and emotional context are securely stored. You can continue adding notes or return to this thread anytime.`,
+          modelUsed: 'gemini-resilience-safeguard',
+        };
+      }
 
       // Generate title, preview, and tags
       const metadataPrompt = `Analyze this user journal reflection and AI response. Generate a concise title (3-6 words), a 1-sentence preview summary, and 2-4 relevant tags.
